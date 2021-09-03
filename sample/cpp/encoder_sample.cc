@@ -19,6 +19,9 @@
 #include <cstdlib>
 #include <cuda_profiler_api.h>
 #include <iostream>
+#include <memory>
+#include <thread>
+#include <vector>
 #include <sys/time.h>
 #include <cuda_fp16.h>
 
@@ -53,7 +56,7 @@ int main(int argc, char* argv[])
   printf("Device %s\n", prop.name);
   bool allow_gemm_test = false;
   if (argc >= 10)
-    allow_gemm_test = (atoi(argv[9]) == 1) ? true : false; 
+    allow_gemm_test = (atoi(argv[9]) == 1) ? true : false;
 
   printf("Device %s\n", prop.name);
   int batch_size = atoi(argv[1]);
@@ -62,18 +65,32 @@ int main(int argc, char* argv[])
   int head_num = atoi(argv[4]);
   int size_per_head = atoi(argv[5]);
   bool is_remove_padding = (bool)atoi(argv[7]);
-  int int8_mode = atoi(argv[8]);	
+  int int8_mode = atoi(argv[8]);
 
-  if(atoi(argv[6]) == 0)
-    encoder_sample<float>(batch_size, num_layers, seq_len, head_num, size_per_head, is_remove_padding, int8_mode, allow_gemm_test);
-  else if(atoi(argv[6]) == 1)
-    encoder_sample<half>(batch_size, num_layers, seq_len, head_num, size_per_head, is_remove_padding, int8_mode, allow_gemm_test);
-  else
-  {
-    printf("[ERROR] is_fp16 should be 0 (use float) or 1 (use half). \n");
-    return -1;
+  std::vector<std::unique_ptr<std::thread>> threads;
+  for (int device_id = 0; device_id < 2; device_id++) {
+    threads.push_back(
+      std::make_unique<std::thread>([device_id, argv, batch_size, num_layers, seq_len, head_num, size_per_head, is_remove_padding, int8_mode, allow_gemm_test]
+        {
+          check_cuda_error(cudaSetDevice(device_id));
+          if(atoi(argv[6]) == 0)
+            encoder_sample<float>(batch_size, num_layers, seq_len, head_num, size_per_head, is_remove_padding, int8_mode, allow_gemm_test);
+          else if(atoi(argv[6]) == 1)
+            encoder_sample<half>(batch_size, num_layers, seq_len, head_num, size_per_head, is_remove_padding, int8_mode, allow_gemm_test);
+          else
+          {
+            printf("[ERROR] is_fp16 should be 0 (use float) or 1 (use half). \n");
+            return -1;
+          }
+          return 0;
+        }
+      )
+    );
   }
-  
+  for(auto & t : threads) {
+    t->join();
+  }
+
   return 0;
 }
 
@@ -104,7 +121,7 @@ void device_malloc_one(T **ptr, int batchSize, int seqLen, int avg_len)
     {
       for (int l2 = 0 ; l2 < avg_len ; l2++)
         tmp[j++] = (T)(1.0f);
-      for (int l2 = avg_len ; l2 < seqLen ; l2++) 
+      for (int l2 = avg_len ; l2 < seqLen ; l2++)
         tmp[j++] = T(0.0f);
     }
   }
@@ -137,7 +154,7 @@ void encoder_sample(int batch_size,
   T *d_output_kernel = NULL, *d_output_bias = NULL, *d_output_layernorm_beta = NULL, *d_output_layernorm_gamma = NULL;
   float *amaxList = NULL;
   int* d_trt_seqlen_offset = NULL;
-  
+
   // pre_process buffer
   T *d_from_tensor_with_padding = NULL;
   T *d_transformer_out_with_padding = NULL;
@@ -169,7 +186,7 @@ void encoder_sample(int batch_size,
     }
     cudaMalloc(&d_trt_seqlen_offset, sizeof(int) * (h_trt_seqlen_size));
     cudaMemcpy(d_trt_seqlen_offset, h_trt_seqlen_offset, sizeof(int) * (h_trt_seqlen_size), cudaMemcpyHostToDevice);
-    device_malloc_one(&d_attr_mask, batch_size, seq_len, seq_len/2);    
+    device_malloc_one(&d_attr_mask, batch_size, seq_len, seq_len/2);
     delete [] h_trt_seqlen_offset;
   }
   else
@@ -247,7 +264,9 @@ void encoder_sample(int batch_size,
 
   const fastertransformer::OperationType type = sizeof(T) == sizeof(float) ? OperationType::FP32 : OperationType::FP16;
   typedef BertEncoderTransformerTraits<type, cuda::OpenMultiHeadAttention> EncoderTraits_;
-  fastertransformer::Allocator<AllocatorType::CUDA> allocator(0);
+  int device_id;
+  check_cuda_error(cudaGetDevice(&device_id));
+  fastertransformer::Allocator<AllocatorType::CUDA> allocator(device_id);
   BertInitParam<T> encoder_param; //init param here
 
   encoder_param.from_tensor = d_from_tensor;
@@ -279,7 +298,7 @@ void encoder_sample(int batch_size,
   encoder_param.trt_seqlen_offset = d_trt_seqlen_offset;
   encoder_param.trt_seqlen_size = h_trt_seqlen_size;
 
-  BertEncoderTransformer<EncoderTraits_> *encoder_transformer_ = 
+  BertEncoderTransformer<EncoderTraits_> *encoder_transformer_ =
           new BertEncoderTransformer<EncoderTraits_>(int8_mode, allow_gemm_test);
 
   encoder_transformer_->allocateBuffer(&allocator, batch_size, from_seq_len, to_seq_len, head_num, size_per_head);
@@ -294,19 +313,19 @@ void encoder_sample(int batch_size,
     {
       cudaMemcpyAsync(d_sequence_length, h_sequence_length, sizeof(int) * batch_size, cudaMemcpyHostToDevice, stream);
       int* h_valid_word_num = new int[1];
-      build_sequence_length_padding_offset_kernelLauncher(d_sequence_length, 
+      build_sequence_length_padding_offset_kernelLauncher(d_sequence_length,
             batch_size, seq_len, d_valid_word_num, d_tmp_sequence_id_offset, stream);
       cudaMemcpyAsync(h_valid_word_num, d_valid_word_num, sizeof(int), cudaMemcpyDeviceToHost, stream);
       const int valid_word_num = h_valid_word_num[0];
       delete h_valid_word_num;
 
-      remove_sequence_length_padding_kernelLauncher(d_from_tensor_with_padding, 
+      remove_sequence_length_padding_kernelLauncher(d_from_tensor_with_padding,
                                                     d_from_tensor,
                                                     d_tmp_sequence_id_offset,
-                                                    d_sequence_id_offset, 
+                                                    d_sequence_id_offset,
                                                     valid_word_num, hidden_dim,
                                                     stream);
-      
+
       encoder_param.sequence_id_offset = d_sequence_id_offset;
       encoder_param.valid_word_num = valid_word_num;
     }
@@ -314,21 +333,21 @@ void encoder_sample(int batch_size,
     {
       encoder_param.valid_word_num = batch_size * seq_len;
     }
-    
+
 
     encoder_transformer_->initialize(encoder_param);
     for(int i = 0; i < num_layers; i++)
       encoder_transformer_->forward();
-    
+
     if(is_remove_padding == true)
     {
-      rebuild_sequence_length_padding_kernelLauncher(d_transformer_out, d_transformer_out_with_padding, 
-                                                      d_sequence_id_offset, 
+      rebuild_sequence_length_padding_kernelLauncher(d_transformer_out, d_transformer_out_with_padding,
+                                                      d_sequence_id_offset,
                                                       encoder_param.valid_word_num, hidden_dim,
                                                       encoder_param.stream);
     }
   }
-  
+
   struct timeval start, end;
   cudaDeviceSynchronize();
   cudaProfilerStart();
@@ -339,19 +358,19 @@ void encoder_sample(int batch_size,
     {
       cudaMemcpyAsync(d_sequence_length, h_sequence_length, sizeof(int) * batch_size, cudaMemcpyHostToDevice, stream);
       int* h_valid_word_num = new int[1];
-      build_sequence_length_padding_offset_kernelLauncher(d_sequence_length, 
+      build_sequence_length_padding_offset_kernelLauncher(d_sequence_length,
             batch_size, seq_len, d_valid_word_num, d_tmp_sequence_id_offset, stream);
       cudaMemcpyAsync(h_valid_word_num, d_valid_word_num, sizeof(int), cudaMemcpyDeviceToHost, stream);
       const int valid_word_num = h_valid_word_num[0];
       delete h_valid_word_num;
 
-      remove_sequence_length_padding_kernelLauncher(d_from_tensor_with_padding, 
+      remove_sequence_length_padding_kernelLauncher(d_from_tensor_with_padding,
                                                     d_from_tensor,
                                                     d_tmp_sequence_id_offset,
-                                                    d_sequence_id_offset, 
+                                                    d_sequence_id_offset,
                                                     valid_word_num, hidden_dim,
                                                     stream);
-      
+
       encoder_param.sequence_id_offset = d_sequence_id_offset;
       encoder_param.valid_word_num = valid_word_num;
     }
@@ -366,25 +385,24 @@ void encoder_sample(int batch_size,
       encoder_transformer_->initialize(encoder_param);
       encoder_transformer_->forward();
     }
-    
+
     if(is_remove_padding == true)
     {
-      rebuild_sequence_length_padding_kernelLauncher(d_transformer_out, d_transformer_out_with_padding, 
-                                                      d_sequence_id_offset, 
+      rebuild_sequence_length_padding_kernelLauncher(d_transformer_out, d_transformer_out_with_padding,
+                                                      d_sequence_id_offset,
                                                       encoder_param.valid_word_num, hidden_dim,
                                                       encoder_param.stream);
     }
   }
-  
+
 
   cudaDeviceSynchronize();
   gettimeofday(&end, NULL);
   cudaProfilerStop();
 
-  printf("[INFO] batch_size %d seq_len %d layer %d FT-CPP-time %.2f ms ( %d iterations) \n", batch_size, seq_len, num_layers, 
+  printf("[INFO] device_id %d batch_size %d seq_len %d layer %d FT-CPP-time %.2f ms ( %d iterations) \n", device_id, batch_size, seq_len, num_layers,
           ((end.tv_sec - start.tv_sec) * 1000 + (end.tv_usec - start.tv_usec) * 0.001) / ite, ite);
 
   delete encoder_transformer_;
   return;
 }
-
